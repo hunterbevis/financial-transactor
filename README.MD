@@ -1,5 +1,7 @@
 # Financial Transactor Engine
 
+![financial transactor dashboard](https://github.com/user-attachments/assets/4c0d8631-c230-4b36-be5a-e02ba9d47872)
+
 A high-concurrency atomic ledger simulation built with go and sveltekit. This project demonstrates Golang's capability to handle massive transaction volumes using its native concurrency primitives and memory management. You the frontend to send 10k - 100k transactions to the Golang server. Tweak the worker delay time, and number of Goroutines to see how Goroutines impact performance.
 
 ## Technical Features
