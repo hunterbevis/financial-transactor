@@ -40,6 +40,7 @@
 	"dependencies": {
 		"@lucide/svelte": "^0.562.0",
 		"bits-ui": "^2.14.4",
+		"svelte-virtual": "^0.6.3",
 		"tailwind-merge": "^3.4.0"
 	}
 }

@@ -1,33 +1,61 @@
-import { writable } from 'svelte/store';
+import { derived, writable } from 'svelte/store';
 
-export type Metrics = {
+export type metricsdata = {
+	cpu_threads: number;
 	goroutines: number;
-	worker_threads: number; // physical/max thread capacity
-	worker_count: number; // active worker pool size from slider
-	total_tx: number;
-	processed_tx: number;
-	failed_tx: number;
-	in_flight_tx: number;
-	balances: Record<string, number>;
-	last_batch_ms: number;
-	latency_ms: number;
-	worker_status: boolean[];
-	active_shards: number[];
-	isConnected: boolean;
+	worker_pool: number;
+	processed: number;
+	session_start_value: number | null;
+	failed: number;
+	queue_len: number;
+	queue_cap: number;
+	isconnected: boolean;
 };
 
-export const metrics = writable<Metrics>({
+// updated to reflect numeric IDs from the golang engine
+export type txevent = {
+	id: number; // changed from string
+	from: number; // changed from string
+	to: number; // changed from string
+	amount: number;
+	submitted_by: string;
+	ts: number;
+};
+
+export const metrics = writable<metricsdata>({
+	cpu_threads: 0,
 	goroutines: 0,
-	worker_threads: 0,
-	worker_count: 0,
-	total_tx: 0,
-	processed_tx: 0,
-	failed_tx: 0,
-	in_flight_tx: 0,
-	balances: {},
-	last_batch_ms: 0,
-	latency_ms: 1,
-	worker_status: [],
-	active_shards: [],
-	isConnected: false
+	worker_pool: 0,
+	processed: 0,
+	failed: 0,
+	session_start_value: null,
+	queue_len: 0,
+	queue_cap: 10000000,
+	isconnected: false
+});
+
+export const queue_pressure = derived(metrics, ($m) => {
+	if (!$m.queue_cap) return 0;
+	return ($m.queue_len / $m.queue_cap) * 100;
+});
+
+export const is_congested = derived(queue_pressure, ($p) => $p > 80);
+
+export const max_tx_log = 100;
+export const txlog = writable<txevent[]>([]);
+
+export function pushtx(tx: txevent) {
+	txlog.update((arr) => {
+		arr.push(tx);
+		if (arr.length > max_tx_log) {
+			arr.shift();
+		}
+		return arr;
+	});
+}
+
+export const session_processed = derived(metrics, ($m) => {
+	if ($m.session_start_value === null) return 0;
+	const diff = $m.processed - $m.session_start_value;
+	return diff < 0 ? 0 : diff;
 });

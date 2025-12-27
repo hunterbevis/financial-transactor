@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"runtime"
 	"sync"
@@ -14,338 +15,299 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// ====================
-// domain & setup
-// ====================
+// constants
 const (
-	shardCount     = 1024
-	accountCount   = 10000
-	initialBalance = 10_000
-	transferAmount = 100
+	shardcount     = 1024
+	accountcount   = 10_000
+	initialbalance = 10_000
+	transferamount = 1
+	maxqueuesize   = 10_000_000
 )
 
-type Transaction struct {
-	ID     string `json:"id"`
-	From   string `json:"from"`
-	To     string `json:"to"`
-	Amount int64  `json:"amount"`
+// transaction
+type transaction struct {
+	ID          uint64 `json:"id"`
+	From        uint32 `json:"from"`
+	To          uint32 `json:"to"`
+	Amount      int64  `json:"amount"`
+	SubmittedBy string `json:"submitted_by"`
+	Ts          int64  `json:"ts"`
 }
 
-type Account struct {
+type account struct {
 	mu      sync.Mutex
-	Balance int64
+	balance int64
 }
 
-type LedgerShard struct {
-	accounts map[string]*Account
+type ledgershard struct {
+	accounts map[uint32]*account
 	mu       sync.RWMutex
 }
 
+// global state
 var (
-	ledger            [shardCount]*LedgerShard
-	txCounter         atomic.Uint64
-	totalTx           atomic.Int64
-	processedTx       atomic.Int64
-	failedTx          atomic.Int64
-	inFlightTx        atomic.Int64
-	lastBatchDuration atomic.Int64
-	latencyMs         atomic.Int64 
-	batchWG           sync.WaitGroup
-	workerStatus      []*atomic.Bool
-	statusMu          sync.Mutex
-	activeWorkerCount atomic.Int64 // tracked for the websocket
+	ledger [shardcount]*ledgershard
+
+	txcounter      atomic.Uint64
+	processedtx    atomic.Int64
+	failedtx       atomic.Int64
+	inflighttx     atomic.Int64 // this is the queue backlog
+	activeworkers  atomic.Int64 // tracking current execution state
+	globalengine   *engine
+	workerpoolsize atomic.Int64
+	txevents       = make(chan transaction, 100000)
+
+	clients   = make(map[*client]struct{})
+	clientsmu sync.Mutex
+
+	upgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
 )
 
-// ====================
-// worker pool
-// ====================
-type WorkerPool struct {
-	jobs    chan Transaction
-	workers int
-	quit    chan struct{}
-	mu      sync.Mutex
+type client struct {
+	send chan []transaction
 }
 
-func NewWorkerPool(size int, queueSize int) *WorkerPool {
-	wp := &WorkerPool{
-		jobs: make(chan Transaction, queueSize),
-		quit: make(chan struct{}),
-	}
-	wp.resize(size)
-	return wp
+func getshardindex(id uint32) uint32 {
+	return id % shardcount
 }
 
-func (wp *WorkerPool) resize(size int) {
-	wp.mu.Lock()
-	defer wp.mu.Unlock()
-	statusMu.Lock()
-	defer statusMu.Unlock()
-
-	delta := size - wp.workers
-
-	if delta > 0 {
-		for range delta {
-			status := &atomic.Bool{}
-			workerStatus = append(workerStatus, status)
-			go wp.worker(status)
-		}
-	} else if delta < 0 {
-		for i := 0; i < -delta; i++ {
-			wp.quit <- struct{}{}
-		}
-		workerStatus = workerStatus[:size]
-	}
-	wp.workers = size
-	activeWorkerCount.Store(int64(size))
-	log.Printf("pool_resize: %d active workers (goroutines)", size)
-}
-
-func (wp *WorkerPool) worker(status *atomic.Bool) {
-	for {
-		select {
-		case tx := <-wp.jobs:
-			status.Store(true)
-			processTransaction(tx)
-			processedTx.Add(1)
-			inFlightTx.Add(-1)
-			batchWG.Done()
-			status.Store(false)
-		case <-wp.quit:
-			return
-		}
-	}
-}
-
-// ====================
-// logic
-// ====================
-func getShardIndex(id string) uint32 {
-	h := uint32(2166136261)
-	for i := 0; i < len(id); i++ {
-		h ^= uint32(id[i])
-		h *= 16777619
-	}
-	return h % shardCount
-}
-
-func processTransaction(tx Transaction) {
-	idxA := getShardIndex(tx.From)
-	idxB := getShardIndex(tx.To)
-
-	if idxA < idxB {
-		ledger[idxA].mu.RLock()
-		ledger[idxB].mu.RLock()
-		defer ledger[idxA].mu.RUnlock()
-		defer ledger[idxB].mu.RUnlock()
-	} else if idxA > idxB {
-		ledger[idxB].mu.RLock()
-		ledger[idxA].mu.RLock()
-		defer ledger[idxB].mu.RUnlock()
-		defer ledger[idxA].mu.RUnlock()
-	} else {
-		ledger[idxA].mu.RLock()
-		defer ledger[idxA].mu.RUnlock()
-	}
-
-	from := ledger[idxA].accounts[tx.From]
-	to := ledger[idxB].accounts[tx.To]
-
-	from.mu.Lock()
-	to.mu.Lock()
-	defer from.mu.Unlock()
-	defer to.mu.Unlock()
-
-	if d := latencyMs.Load(); d > 0 {
-		time.Sleep(time.Duration(d) * time.Millisecond)
-	}
-
-	if from.Balance < tx.Amount {
-		failedTx.Add(1)
+func processtransaction(tx transaction) {
+	if tx.From == tx.To {
+		processedtx.Add(1)
 		return
 	}
 
-	from.Balance -= tx.Amount
-	to.Balance += tx.Amount
+	idxa := getshardindex(tx.From)
+	idxb := getshardindex(tx.To)
+
+	firstidx, secondidx := idxa, idxb
+	if idxa > idxb {
+		firstidx, secondidx = idxb, idxa
+	}
+
+	if idxa != idxb {
+		ledger[firstidx].mu.RLock()
+		ledger[secondidx].mu.RLock()
+		defer ledger[firstidx].mu.RUnlock()
+		defer ledger[secondidx].mu.RUnlock()
+	} else {
+		ledger[firstidx].mu.RLock()
+		defer ledger[firstidx].mu.RUnlock()
+	}
+
+	accta := ledger[idxa].accounts[tx.From]
+	acctb := ledger[idxb].accounts[tx.To]
+
+	if tx.From < tx.To {
+		accta.mu.Lock()
+		acctb.mu.Lock()
+	} else {
+		acctb.mu.Lock()
+		accta.mu.Lock()
+	}
+	defer accta.mu.Unlock()
+	defer acctb.mu.Unlock()
+
+	if accta.balance < tx.Amount {
+		failedtx.Add(1)
+		return
+	}
+
+	accta.balance -= tx.Amount
+	acctb.balance += tx.Amount
+	processedtx.Add(1)
+
+	select {
+	case txevents <- tx:
+	default:
+	}
 }
 
-// ====================
-// handlers
-// ====================
-func submit(wp *WorkerPool) http.HandlerFunc {
+type engine struct {
+	jobs chan transaction
+}
+
+func newengine(workers int) *engine {
+	e := &engine{
+		jobs: make(chan transaction, maxqueuesize),
+	}
+	workerpoolsize.Store(int64(workers))
+	for i := 0; i < workers; i++ {
+		go e.worker()
+	}
+	return e
+}
+
+func (e *engine) worker() {
+	for tx := range e.jobs {
+		activeworkers.Add(1) // increment when starting work
+		processtransaction(tx)
+		inflighttx.Add(-1)
+		activeworkers.Add(-1) // decrement when done
+		
+		time.Sleep(50 * time.Microsecond)
+	}
+}
+
+func submitbatch(eng *engine) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var payload struct{ Count int }
+		var payload struct {
+			Count int `json:"count"`
+		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "invalid request", 400)
 			return
 		}
 
-		start := time.Now()
-		count := payload.Count
+		if inflighttx.Load()+int64(payload.Count) > maxqueuesize {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
 
-		go func() {
-			for range count {
-				srcIdx := rand.Intn(accountCount / 2)
-				snkIdx := (accountCount / 2) + rand.Intn(accountCount / 2)
+		inflighttx.Add(int64(payload.Count))
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
 
-				tx := Transaction{
-					ID:     fmt.Sprintf("tx_%d", txCounter.Add(1)),
-					From:   fmt.Sprintf("acct_%d", srcIdx),
-					To:     fmt.Sprintf("acct_%d", snkIdx),
-					Amount: transferAmount,
+		go func(count int, submitter string) {
+			for i := 0; i < count; i++ {
+				eng.jobs <- transaction{
+					ID:          txcounter.Add(1),
+					From:        uint32(rand.Intn(accountcount)),
+					To:          uint32(rand.Intn(accountcount)),
+					Amount:      transferamount,
+					SubmittedBy: submitter,
+					Ts:          time.Now().UnixMilli(),
 				}
-
-				totalTx.Add(1)
-				inFlightTx.Add(1)
-				batchWG.Add(1)
-				wp.jobs <- tx
 			}
-
-			batchWG.Wait()
-			lastBatchDuration.Store(time.Since(start).Milliseconds())
-		}()
+		}(payload.Count, ip)
 
 		w.WriteHeader(http.StatusAccepted)
 	}
 }
 
-func updateLatency(w http.ResponseWriter, r *http.Request) {
-	var payload struct{ Latency int64 }
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		http.Error(w, "invalid payload", http.StatusBadRequest)
-		return
-	}
-	latencyMs.Store(payload.Latency)
-	w.WriteHeader(http.StatusOK)
-}
-
-func resetLedger(w http.ResponseWriter, r *http.Request) {
-	totalTx.Store(0)
-	processedTx.Store(0)
-	failedTx.Store(0)
-	inFlightTx.Store(0)
-	txCounter.Store(0)
-	lastBatchDuration.Store(0)
-
-	for i := range shardCount {
-		ledger[i].mu.Lock()
-		for _, acc := range ledger[i].accounts {
-			acc.mu.Lock()
-			acc.Balance = initialBalance
-			acc.mu.Unlock()
-		}
-		ledger[i].mu.Unlock()
-	}
-	w.WriteHeader(http.StatusOK)
-}
-
-func metricsWS(w http.ResponseWriter, r *http.Request) {
-	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+func wsmetrics(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
 	defer conn.Close()
 
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(16 * time.Millisecond)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		bals := make(map[string]int64)
-		activeShards := make([]int, 0)
-
-		for i := range accountCount {
-			id := fmt.Sprintf("acct_%d", i)
-			idx := getShardIndex(id)
-			ledger[idx].mu.RLock()
-			bals[id] = ledger[idx].accounts[id].Balance
-			ledger[idx].mu.RUnlock()
+		stats := map[string]interface{}{
+			"cpu_threads": runtime.GOMAXPROCS(0),
+			"goroutines":  runtime.NumGoroutine(),
+			"worker_pool": workerpoolsize.Load(),
+			"failed":      failedtx.Load(),
+			"processed":   processedtx.Load(),
+			"queue_len":   inflighttx.Load(),
+			"queue_cap":   maxqueuesize,
+			// active_workers is kept in the engine but not sent as "in_flight"
 		}
-
-		for i := range shardCount {
-			if !ledger[i].mu.TryLock() {
-				activeShards = append(activeShards, i)
-			} else {
-				ledger[i].mu.Unlock()
-			}
-		}
-
-		statusMu.Lock()
-		busyWorkers := make([]bool, len(workerStatus))
-		for i, s := range workerStatus {
-			busyWorkers[i] = s.Load()
-		}
-		statusMu.Unlock()
-
-		msg := map[string]any{
-			"goroutines":      runtime.NumGoroutine(),
-			"worker_threads":  runtime.GOMAXPROCS(0), // actual OS threads limit
-			"worker_count":    activeWorkerCount.Load(),
-			"total_tx":        totalTx.Load(),
-			"processed_tx":    processedTx.Load(),
-			"failed_tx":       failedTx.Load(),
-			"in_flight_tx":    inFlightTx.Load(),
-			"balances":        bals,
-			"last_batch_ms":   lastBatchDuration.Load(),
-			"worker_status":   busyWorkers,
-			"active_shards":   activeShards,
-			"latency_ms":      latencyMs.Load(),
-		}
-		if err := conn.WriteJSON(msg); err != nil {
+		if err := conn.WriteJSON(stats); err != nil {
 			break
 		}
 	}
 }
 
-func resizeWorkers(wp *WorkerPool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var payload struct{ Workers int }
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			return
-		}
-		if payload.Workers > 0 {
-			wp.resize(payload.Workers)
-		}
-		w.WriteHeader(http.StatusOK)
+func wstxstream(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
 	}
-}
 
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin != "" {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
+	c := &client{send: make(chan []transaction, 128)}
+	clientsmu.Lock()
+	clients[c] = struct{}{}
+	clientsmu.Unlock()
+
+	defer func() {
+		clientsmu.Lock()
+		delete(clients, c)
+		clientsmu.Unlock()
+		conn.Close()
+	}()
+
+	for batch := range c.send {
+		if err := conn.WriteJSON(batch); err != nil {
+			break
 		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	}
 }
 
 func main() {
-	latencyMs.Store(1)
+	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	for i := range shardCount {
-		ledger[i] = &LedgerShard{accounts: make(map[string]*Account)}
+	for i := range shardcount {
+		ledger[i] = &ledgershard{accounts: make(map[uint32]*account)} 
 	}
 
-	for i := range accountCount {
-		id := fmt.Sprintf("acct_%d", i)
-		idx := getShardIndex(id)
-		ledger[idx].accounts[id] = &Account{Balance: initialBalance}
+	for i := range accountcount {
+		id := uint32(i)
+		idx := getshardindex(id)
+		ledger[idx].accounts[id] = &account{balance: initialbalance}
 	}
 
-	wp := NewWorkerPool(runtime.NumCPU(), 1_000_000)
+	optimalworkers := runtime.NumCPU() * 4
+	globalengine = newengine(optimalworkers)
+
+	go func() {
+		ticker := time.NewTicker(16 * time.Millisecond)
+		defer ticker.Stop()
+		var batch []transaction
+		for {
+			select {
+			case tx := <-txevents:
+				batch = append(batch, tx)
+				if len(batch) > 5000 {
+					flushbatch(&batch)
+				}
+			case <-ticker.C:
+				if len(batch) > 0 {
+					flushbatch(&batch)
+				}
+			}
+		}
+	}()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/submit", submit(wp))
-	mux.HandleFunc("/resize", resizeWorkers(wp))
-	mux.HandleFunc("/reset", resetLedger)
-	mux.HandleFunc("/latency", updateLatency)
-	mux.HandleFunc("/ws/metrics", metricsWS)
+	mux.HandleFunc("/submit", submitbatch(globalengine))
+	mux.HandleFunc("/ws/metrics", wsmetrics)
+	mux.HandleFunc("/ws/tx", wstxstream)
+	mux.HandleFunc("/reset", func(w http.ResponseWriter, r *http.Request) {
+		processedtx.Store(0)
+		failedtx.Store(0)
+		inflighttx.Store(0)
+		w.WriteHeader(http.StatusOK)
+	})
 
-	log.Printf("Engine v1.0 running with %d usable cpu threads", runtime.NumCPU())
-	http.ListenAndServe(":8080", corsMiddleware(mux))
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == "OPTIONS" {
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+
+	fmt.Printf("engine live on :8080 [workers: %d] [cores: %d]\n", optimalworkers, runtime.NumCPU())
+	log.Fatal(http.ListenAndServe(":8080", handler))
+}
+
+func flushbatch(batch *[]transaction) {
+	clientsmu.Lock()
+	payload := make([]transaction, len(*batch))
+	copy(payload, *batch)
+	for c := range clients {
+		select {
+		case c.send <- payload:
+		default:
+		}
+	}
+	clientsmu.Unlock()
+	*batch = nil
 }
