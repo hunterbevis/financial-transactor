@@ -12,11 +12,10 @@ export type metricsdata = {
 	isconnected: boolean;
 };
 
-// updated to reflect numeric IDs from the golang engine
 export type txevent = {
-	id: number; // changed from string
-	from: number; // changed from string
-	to: number; // changed from string
+	id: number;
+	from: number;
+	to: number;
 	amount: number;
 	submitted_by: string;
 	ts: number;

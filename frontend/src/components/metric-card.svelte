@@ -1,11 +1,13 @@
 <script lang="ts">
-	import { InfoIcon } from '@lucide/svelte';
+	import { Info as InfoIcon } from '@lucide/svelte';
 	import * as HoverCard from '../components/hover-card/index.ts';
 
 	export let label: string;
 	export let value: number | string;
-	export let title: string = ''; // optional title for the tooltip
-	export let description: string = ''; // providing this makes the hovercard appear
+	export let title: string = '';
+	export let description: string = '';
+	let className: string = '';
+	export { className as class };
 </script>
 
 <div class="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 shadow-sm">
@@ -43,7 +45,9 @@
 			</HoverCard.Root>
 		{/if}
 	</div>
-	<div class="mt-2 font-mono text-2xl font-semibold text-white">
+	<div
+		class="mt-2 truncate font-mono text-2xl font-semibold whitespace-nowrap text-white {className}"
+	>
 		{typeof value === 'number' ? value.toLocaleString() : value}
 	</div>
 </div>

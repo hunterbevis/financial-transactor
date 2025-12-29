@@ -2,30 +2,29 @@
 
 ![financial transactor dashboard](https://github.com/user-attachments/assets/4c0d8631-c230-4b36-be5a-e02ba9d47872)
 
-A high-concurrency atomic ledger simulation built with go and sveltekit. This project demonstrates Golang's capability to handle massive transaction volumes using its native concurrency primitives and memory management. You the frontend to send 10k - 100k transactions to the Golang server. Tweak the worker delay time, and number of Goroutines to see how Goroutines impact performance.
+A high-concurrency atomic ledger simulation built with go and sveltekit. This project demonstrates Golang's capability to handle massive transaction volumes using its native concurrency primitives and memory management. All connected users can send 10k - 5m transactions to the Golang server and watch everyone's transactions get executed in real-time!
 
 ## Technical Features
 
-- **High-Concurrency Worker Pool**: Dynamic scaling of goroutines to process transaction batches based on system load.
+- **High-Concurrency Worker Pool**: Worker pools are set to be 4x the size of threads of the CPU the server is running on.
 - **Sharded Ledger**: Utilizes mutex-sharding to minimize lock contention across 10,000 accounts, allowing for parallel writes.
-- **Real-Time Heatmap**: A visual representation of ledger state changes streamed via websockets. The heatmap has 10k slots. Each slot represents a bank account each containing `$10k` USD. The first 0-5k accounts (the top half) are sending `$100` per transaction to accounts 5001-10k (bottom half). As account balances go below `$10k`, the box gets more and more red until zero (black at zero). As they get above `$10k` they get more green.
-- **Latency Simulation**: Adjustable worker delay to observe how go handles i/o-bound vs cpu-bound tasks. Values are 0-50ms.
+- **Latency Simulation**: Worker delay to observe how go handles i/o-bound vs cpu-bound tasks. There's a 0.5ms delay per transaction.
 - **Atomic Operations**: Ensures data integrity and prevents race conditions during rapid-fire balance transfers.
 
 ## Tech Stack
 
 - **Backend**: Golang (goroutines, channels, sharded mutexes)
 - **Frontend**: Sveltekit, tailwind css, lucide svelte
-- **Communication**: High-frequency websockets for real-time metrics streaming
+- **Communication**: High-frequency websockets for real-time transaction and metrics streaming
 
 ## Concurrency metrics and monitoring
 
-The engine tracks and visualizes the relationship between different layers of the runtime:
+the dashboard provides a direct window into the go runtime performance:
 
-- **CPU Threads**: Physical hardware limits defined by `$GOMAXPROCS$`.
-- **Goroutines**: The total number of living routines managed by the go scheduler.
-- **Worker Pool**: The active application-level workers pulling from the transaction queue.
-- **Shard Lock Contention**: Visual feedback on mutex locks and state synchronization across the ledger shards.
+- **Concurrency State**: real-time tracking of living **goroutines** vs. active **worker pool** size.
+- **System Throughput**: live **velocity (tps)** and **queue** depth monitoring to visualize backpressure handling.
+- **Live Transaction Log**: a high-speed stream of incoming transactions showing source/destination accounts and system ray ids.
+- **System Metrics**: a view into the shards and accounts on the backend server.
 
 ## Getting started
 

@@ -20,8 +20,6 @@ export function connectmetrics(): () => void {
 			try {
 				const data = JSON.parse(event.data);
 				metrics.update((m) => {
-					// if this is the first message of the session,
-					// lock in the current 'processed' count as the baseline
 					const baseline = m.session_start_value === null ? data.processed : m.session_start_value;
 
 					return {
@@ -37,8 +35,6 @@ export function connectmetrics(): () => void {
 		};
 
 		ws.onclose = () => {
-			// clear the baseline on close so the next connection
-			// recalculates the session start correctly
 			metrics.update((m) => ({ ...m, isconnected: false, session_start_value: null }));
 
 			if (shouldreconnect) {
@@ -68,7 +64,6 @@ export function connecttxstream(): () => void {
 			try {
 				const data = JSON.parse(event.data);
 
-				// data.id, data.from, and data.to are now numbers from go
 				if (Array.isArray(data)) {
 					for (let i = 0; i < data.length; i++) {
 						const tx = data[i];

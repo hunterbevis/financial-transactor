@@ -10,12 +10,11 @@ async function handleresponse(res: Response) {
 	return res;
 }
 
-export async function submittransactions(count: number) {
-	// added headers so go's json.NewDecoder(r.Body) works correctly
+export async function submittransactions(count: number, userName: string) {
 	const res = await fetch(`${base_url}/submit`, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ count })
+		body: JSON.stringify({ count, user_name: userName })
 	});
 
 	return handleresponse(res);

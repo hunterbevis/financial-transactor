@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"net"
 	"net/http"
 	"runtime"
 	"sync"
@@ -15,7 +14,6 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// constants
 const (
 	shardcount     = 1024
 	accountcount   = 10_000
@@ -24,7 +22,6 @@ const (
 	maxqueuesize   = 10_000_000
 )
 
-// transaction
 type transaction struct {
 	ID          uint64 `json:"id"`
 	From        uint32 `json:"from"`
@@ -44,15 +41,14 @@ type ledgershard struct {
 	mu       sync.RWMutex
 }
 
-// global state
 var (
 	ledger [shardcount]*ledgershard
 
 	txcounter      atomic.Uint64
 	processedtx    atomic.Int64
 	failedtx       atomic.Int64
-	inflighttx     atomic.Int64 // this is the queue backlog
-	activeworkers  atomic.Int64 // tracking current execution state
+	inflighttx     atomic.Int64
+	activeworkers  atomic.Int64
 	globalengine   *engine
 	workerpoolsize atomic.Int64
 	txevents       = make(chan transaction, 100000)
@@ -134,7 +130,7 @@ func newengine(workers int) *engine {
 		jobs: make(chan transaction, maxqueuesize),
 	}
 	workerpoolsize.Store(int64(workers))
-	for i := 0; i < workers; i++ {
+	for range workers {
 		go e.worker()
 	}
 	return e
@@ -142,10 +138,10 @@ func newengine(workers int) *engine {
 
 func (e *engine) worker() {
 	for tx := range e.jobs {
-		activeworkers.Add(1) // increment when starting work
+		activeworkers.Add(1)
 		processtransaction(tx)
 		inflighttx.Add(-1)
-		activeworkers.Add(-1) // decrement when done
+		activeworkers.Add(-1)
 		
 		time.Sleep(50 * time.Microsecond)
 	}
@@ -154,23 +150,29 @@ func (e *engine) worker() {
 func submitbatch(eng *engine) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var payload struct {
-			Count int `json:"count"`
+			Count    int    `json:"count"`
+			UserName string `json:"user_name"`
 		}
+		
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, "invalid request", 400)
 			return
 		}
 
-		if inflighttx.Load()+int64(payload.Count) > maxqueuesize {
-			w.WriteHeader(http.StatusTooManyRequests)
+		if payload.Count != 10_000 && payload.Count != 1_000_000 {
 			return
 		}
 
-		inflighttx.Add(int64(payload.Count))
-		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if inflighttx.Load()+int64(payload.Count) > maxqueuesize {
+			return
+		}
+
+		metadata := getmetadata(r, payload.UserName)
 
 		go func(count int, submitter string) {
-			for i := 0; i < count; i++ {
+			inflighttx.Add(int64(count)) 
+
+			for range count {
 				eng.jobs <- transaction{
 					ID:          txcounter.Add(1),
 					From:        uint32(rand.Intn(accountcount)),
@@ -180,10 +182,37 @@ func submitbatch(eng *engine) http.HandlerFunc {
 					Ts:          time.Now().UnixMilli(),
 				}
 			}
-		}(payload.Count, ip)
+		}(payload.Count, metadata)
 
 		w.WriteHeader(http.StatusAccepted)
 	}
+}
+
+func getmetadata(r *http.Request, customName string) string {
+	country := r.Header.Get("Cf-Ipcountry")
+	if country == "" {
+		country = "XX"
+	}
+
+	if customName != "" {
+		if len(customName) > 12 {
+			customName = customName[:12]
+		}
+		return fmt.Sprintf("%s-%s", country, customName)
+	}
+
+	ip := r.Header.Get("Cf-Connecting-Ip")
+	if ip == "" || ip == "::1" || ip == "127.0.0.1" {
+		return fmt.Sprintf("%s-LOCAL", country)
+	}
+	return fmt.Sprintf("%s-%s", country, maskip(ip))
+}
+
+func maskip(ip string) string {
+	if len(ip) < 4 {
+		return "****"
+	}
+	return ip[len(ip)-4:]
 }
 
 func wsmetrics(w http.ResponseWriter, r *http.Request) {
@@ -205,7 +234,6 @@ func wsmetrics(w http.ResponseWriter, r *http.Request) {
 			"processed":   processedtx.Load(),
 			"queue_len":   inflighttx.Load(),
 			"queue_cap":   maxqueuesize,
-			// active_workers is kept in the engine but not sent as "in_flight"
 		}
 		if err := conn.WriteJSON(stats); err != nil {
 			break
@@ -285,9 +313,15 @@ func main() {
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := r.Header.Get("Origin")
+		
+		if origin == "https://www.lefthorizon.com" || origin == "https://lefthorizon.com" || origin == "http://localhost:5173" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
+
 		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
 		if r.Method == "OPTIONS" {
 			return
 		}
